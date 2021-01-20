@@ -75,6 +75,57 @@ defmodule RetWeb.AuthChannel do
     {:noreply, socket}
   end
 
+  # register account without authentication by email
+  def handle_in("auth_request_to_verified", %{"email" => email, "origin" => origin}, socket) do
+    if !Map.get(socket.assigns, :used) do
+      socket = socket |> assign(:used, true)
+
+      account = email |> Account.account_for_email()
+      account_disabled = account && account.state == :disabled
+
+      if !account_disabled && (can?(nil, create_account(nil)) || !!account) do
+        # Create token + send email
+        %LoginToken{token: token, payload_key: payload_key} = LoginToken.new_login_token_for_email(email)
+
+        encrypted_payload = %{"email" => email} |> Poison.encode!() |> Crypto.encrypt(payload_key) |> :base64.encode()
+
+        # signin_args = %{
+        #   auth_topic: socket.topic,
+        #   auth_token: token,
+        #   auth_origin: origin,
+        #   auth_payload: encrypted_payload
+        # }
+
+        Statix.increment("ret.emails.auth.attempted", 1)
+
+        # if RetWeb.Email.enabled?() do
+        #   RetWeb.Email.auth_email(email, signin_args) |> Ret.Mailer.deliver_now()
+        # end
+
+        # Statix.increment("ret.emails.auth.sent", 1)
+
+        Process.send_after(self(), :close_channel, 1000 * 5)
+
+        # Slow down token guessing
+        :timer.sleep(500)
+
+        case LoginToken.lookup_by_token(token) do
+          %LoginToken{identifier_hash: identifier_hash, payload_key: payload_key} ->
+            decrypted_payload = encrypted_payload |> :base64.decode() |> Ret.Crypto.decrypt(payload_key) |> Poison.decode!()
+
+          broadcast_credentials_and_payload(identifier_hash, decrypted_payload, socket)
+
+          LoginToken.expire(token)
+
+          _ ->
+          GenServer.cast(self(), :close)
+        end
+
+        {:noreply, socket}
+      end
+    end
+  end
+
   def handle_in(_event, _payload, socket) do
     {:noreply, socket}
   end
